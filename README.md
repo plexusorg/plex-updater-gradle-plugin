@@ -2,8 +2,10 @@
 
 The Plex Updater Gradle Plugin writes the metadata that Plex's built-in updater reads for a Jenkins build of Plex or a
 Plex module: the build's file, and the latest pointers of its channel (`dev` for a `-SNAPSHOT` version, `stable`
-otherwise). Its `updaterMetadata` task writes them to `build/updater`, with a `telesphorepo.toml` for the
-`plex-update-files` repository, and the Jenkins job uploads them with `telesphorepo publish`.
+otherwise). Its `updaterMetadata` task writes them to `build/updater`, and `publishUpdaterMetadata` uploads them to the
+`plex-update-files` repository on Telesphorepo with the Jenkins job's identity token. Bind the `telesphorepo-id-token`
+credential to `OIDC_TOKEN` and run `./gradlew build publishUpdaterMetadata`. The task runs the Telesphorepo CLI that the
+server serves, after it checks the CLI's SHA-256, so the Jenkins agent needs nothing installed.
 
 A module needs only the plugin: its name and API compatibility come from `module.yml`, and its jar is the Shadow jar
 when the project has one, else the plain jar. Plex sets its own:

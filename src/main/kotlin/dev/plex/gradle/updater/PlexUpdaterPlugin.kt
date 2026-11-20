@@ -4,22 +4,33 @@ import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.file.ArchiveOperations
 import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.FileSystemOperations
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputDirectory
 import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import org.gradle.api.tasks.bundling.AbstractArchiveTask
+import org.gradle.process.ExecOperations
 import org.gradle.work.DisableCachingByDefault
 import java.io.File
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.security.MessageDigest
+import java.time.Duration
 import java.time.Instant
+import javax.inject.Inject
 
 class PlexUpdaterPlugin : Plugin<Project> {
     override fun apply(project: Project) {
@@ -39,7 +50,7 @@ class PlexUpdaterPlugin : Plugin<Project> {
         }.flatMap { (it as AbstractArchiveTask).archiveFile })
         extension.artifactPath.convention(extension.artifact.map { it.asFile.relativeTo(project.rootDir).invariantSeparatorsPath })
 
-        project.tasks.register(TASK_NAME, UpdaterMetadataTask::class.java) {
+        val metadata = project.tasks.register(TASK_NAME, UpdaterMetadataTask::class.java) {
             it.group = "plex"
             it.description = "Writes the updater metadata of this Jenkins build to build/updater, for telesphorepo publish."
             it.artifact.set(extension.artifact)
@@ -53,6 +64,14 @@ class PlexUpdaterPlugin : Plugin<Project> {
             it.repository.set(extension.repository)
             it.outputDirectory.set(project.layout.buildDirectory.dir("updater"))
         }
+
+        project.tasks.register(PUBLISH_TASK_NAME, PublishUpdaterMetadataTask::class.java) {
+            it.group = "plex"
+            it.description = "Uploads the updater metadata of this Jenkins build with the job's identity token (OIDC_TOKEN)."
+            it.server.set(extension.server)
+            it.metadataDirectory.set(metadata.flatMap { task -> task.outputDirectory })
+            it.cliDirectory.set(project.layout.buildDirectory.dir("telesphorepo-cli"))
+        }
     }
 
     private fun topLevelFields(yaml: String): Map<String, String> {
@@ -63,7 +82,21 @@ class PlexUpdaterPlugin : Plugin<Project> {
 
     companion object {
         const val TASK_NAME = "updaterMetadata"
+        const val PUBLISH_TASK_NAME = "publishUpdaterMetadata"
     }
+}
+
+private fun sha256(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
 abstract class PlexUpdaterExtension {
@@ -190,19 +223,6 @@ abstract class UpdaterMetadataTask : DefaultTask() {
         }
     }
 
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
     private fun json(fields: Map<String, Any>): String = buildString {
         append("{\n")
         fields.entries.forEachIndexed { index, (key, value) ->
@@ -237,5 +257,92 @@ abstract class UpdaterMetadataTask : DefaultTask() {
             }
         }
         append('"')
+    }
+}
+
+/**
+ * Runs the Telesphorepo CLI of [server], the build the server itself serves at /cli/, so the upload speaks the server's
+ * own protocol. The CLI mints its publish session with the Jenkins identity token in OIDC_TOKEN.
+ */
+@DisableCachingByDefault(because = "It uploads to a server.")
+abstract class PublishUpdaterMetadataTask @Inject constructor(
+    private val archives: ArchiveOperations,
+    private val files: FileSystemOperations,
+    private val exec: ExecOperations,
+) : DefaultTask() {
+    @get:Input
+    abstract val server: Property<String>
+
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val metadataDirectory: DirectoryProperty
+
+    @get:Internal
+    abstract val cliDirectory: DirectoryProperty
+
+    @TaskAction
+    fun publish() {
+        exec.exec {
+            it.workingDir = metadataDirectory.get().asFile
+            it.commandLine(cli().absolutePath, "publish", "--tree", "api", "--into", "api")
+        }
+    }
+
+    private fun cli(): File {
+        val base = server.get().trimEnd('/')
+        val osName = System.getProperty("os.name").lowercase()
+        val os = when {
+            osName.startsWith("windows") -> "windows"
+            osName.startsWith("mac") -> "darwin"
+            osName.startsWith("linux") -> "linux"
+            else -> throw GradleException("$base has no Telesphorepo CLI for ${System.getProperty("os.name")}")
+        }
+        val arch = when (System.getProperty("os.arch").lowercase()) {
+            "amd64", "x86_64" -> "amd64"
+            "aarch64", "arm64" -> "arm64"
+            else -> throw GradleException("$base has no Telesphorepo CLI for the CPU ${System.getProperty("os.arch")}")
+        }
+        val archive = "telesphorepo_${os}_$arch" + if (os == "windows") ".zip" else ".tar.gz"
+
+        val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).followRedirects(HttpClient.Redirect.NORMAL).build()
+        val want = get(http, "$base/cli/SHA256SUMS", HttpResponse.BodyHandlers.ofString()).lineSequence()
+            .map { it.trim().split(Regex("\\s+")) }
+            .firstOrNull { it.size == 2 && it[1] == archive }
+            ?.get(0)
+            ?: throw GradleException("$base has no Telesphorepo CLI for $os/$arch")
+
+        val dir = cliDirectory.get().asFile.resolve(want)
+        val executable = dir.resolve(if (os == "windows") "telesphorepo.exe" else "telesphorepo")
+        if (executable.isFile) {
+            return executable
+        }
+        val download = cliDirectory.get().asFile.resolve(archive)
+        download.parentFile.mkdirs()
+        get(http, "$base/cli/$archive", HttpResponse.BodyHandlers.ofFile(download.toPath()))
+        val got = sha256(download)
+        if (got != want) {
+            download.delete()
+            throw GradleException("The SHA-256 of $base/cli/$archive is $got, but $base/cli/SHA256SUMS names $want.")
+        }
+        files.copy {
+            it.from(if (os == "windows") archives.zipTree(download) else archives.tarTree(archives.gzip(download)))
+            it.include(executable.name)
+            it.into(dir)
+        }
+        download.delete()
+        if (!executable.isFile) {
+            throw GradleException("$base/cli/$archive does not hold ${executable.name}.")
+        }
+        executable.setExecutable(true)
+        return executable
+    }
+
+    private fun <T> get(http: HttpClient, url: String, body: HttpResponse.BodyHandler<T>): T {
+        val request = HttpRequest.newBuilder(URI(url)).timeout(Duration.ofMinutes(2)).build()
+        val response = http.send(request, body)
+        if (response.statusCode() != 200) {
+            throw GradleException("$url answered ${response.statusCode()}.")
+        }
+        return response.body()
     }
 }
